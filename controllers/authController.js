@@ -55,6 +55,7 @@ const loginUser = async (req, res) => {
         name: userFind.name,
         email: userFind.email,
         role: userFind.role,
+        _id: userFind._id,
         token: generateToken(userFind._id),
       }
       res.json({status: 200, user: user});

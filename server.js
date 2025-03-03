@@ -7,6 +7,7 @@ require('dotenv').config();
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const leadRoutes = require('./routes/leadRoutes');
 const authRoutes = require('./routes/authRoutes');
+const callHistoryRoutes = require('./routes/callHistoryRoutes');
 const connectDB = require('./config/database');
 const app = express();
 const server = http.createServer(app);
@@ -74,6 +75,7 @@ const broadcastCallStatus = (data) => {
 };
 
 app.use('/api/leads', leadRoutes);
+app.use('/api/call-history', callHistoryRoutes);
 app.use('/api/auth', authRoutes);
 // API to get ICE servers (STUN/TURN)
 app.get('/api/turn-credentials', async (req, res) => {
@@ -119,7 +121,7 @@ app.get('/api/token', (req, res) => {
 });
 
 app.post('/api/calls/initiate', async (req, res) => {
-  const { from, to } = req.body;
+  const { from, to, userId } = req.body;
 
   if (!to) {
     console.error("❌ ERROR: 'To' number is missing in the request.");
@@ -137,13 +139,19 @@ app.post('/api/calls/initiate', async (req, res) => {
       from: from,
       record: true,
       statusCallback: `${process.env.BASE_URL}/api/calls/status`,
-      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'canceled', 'busy'],
       statusCallbackMethod: 'POST',
       timeout: 60
     });
-
-    // ✅ Store original outbound call
-    activeCalls.set(call.sid, { callSid: call.sid, to: formattedNumber, status: 'initiated', conferenceName: `conf_${formattedNumber}` });
+    console.log(userId, 'User Id....')
+    // Store original outbound call with userId
+    activeCalls.set(call.sid, { 
+      callSid: call.sid, 
+      to: formattedNumber, 
+      status: 'initiated', 
+      conferenceName: `conf_${formattedNumber}`,
+      userId: userId 
+    });
 
     console.log(`📞 Call created with SID: ${call.sid}`);
 
@@ -190,7 +198,7 @@ app.post('/api/twiml/connect', async (req, res) => {
 });
 
 
-app.post('/api/calls/status', (req, res) => {
+app.post('/api/calls/status', async (req, res) => {
   const callSid = req.body.CallSid || req.body.callSid;
   const callStatus = req.body.CallStatus;
 
@@ -200,19 +208,64 @@ app.post('/api/calls/status', (req, res) => {
       '\n - CallStatus:', callStatus,
       '\n - CallDuration:', req.body.CallDuration
   );
+  console.log(req.body);
 
-  // 🔴 **Detect when Twilio marks the call as ended**
-  if (callStatus === 'completed') {
-      console.log(`✅ Call ${callSid} has ended. Notifying clients...`);
+  try {
+      // Get the call data and user ID
+      const callData = activeCalls.get(callSid);
+      const userId = callData?.userId;
 
-      // Remove call from active calls
+      if (userId) {
+          // Create call history data
+          const callHistoryData = {
+              callId: callSid,
+              status: callStatus,
+              from: req.body.From,
+              to: req.body.To,
+              timestamp: req.body.Timestamp || new Date().toISOString(),
+              duration: req.body.CallDuration || 0,
+              number: req.body.Direction === 'inbound' ? req.body.From : req.body.To,
+              userId: userId
+          };
+
+          // Save to database
+          try {
+              await CallHistory.findOneAndUpdate(
+                  { callId: callSid },
+                  callHistoryData,
+                  { upsert: true, new: true }
+              );
+          } catch (dbError) {
+              console.error('Error saving call history:', dbError);
+          }
+      }
+
+      // Broadcast call status to all clients
+      broadcastCallStatus({
+          callSid: callSid,
+          status: callStatus,
+          from: req.body.From,
+          to: req.body.To,
+          timestamp: req.body.Timestamp || new Date().toISOString(),
+          duration: req.body.CallDuration
+      });
+
+      // Handle terminal call states
+  if (['completed', 'canceled', 'busy', 'no-answer', 'failed'].includes(callStatus)) {
+          console.log(`✅ Call ${callSid} has ended. Cleaning up...`);
       activeCalls.delete(callSid);
-
-      // **Emit WebSocket event to notify frontend**
-      io.emit('callEnded', { callSid });
+          io.emit('callEnded', { 
+              callSid,
+              status: callStatus,
+              timestamp: req.body.Timestamp || new Date().toISOString()
+          });
   }
 
   res.sendStatus(200);
+  } catch (error) {
+      console.error('Error handling call status:', error);
+      res.sendStatus(500);
+  }
 });
 
 app.post('/api/calls/end', async (req, res) => {
@@ -383,14 +436,13 @@ app.post('/api/calls/accept', async (req, res) => {
       CallSid: callData.CallSid,
       from: process.env.TWILIO_PHONE_NUMBER,
       statusCallback: `${process.env.BASE_URL}/api/calls/status`,
-      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'canceled', 'busy'],
       statusCallbackMethod: 'POST'
     });
 
     // ✅ Store agent call sid
     callData.agentCallSid = agentCall.sid;
-    -     activeCalls.set(agentCall.sid, callData);  // Ensure we track it
-    +      activeCalls.set(agentCall.sid, callData);  // Ensure we track it
+    activeCalls.set(agentCall.sid, callData);  // Ensure we track it
     res.json({ success: true, agentCallSid: agentCall.sid });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -474,6 +526,19 @@ app.post('/api/twiml/fallback', (req, res) => {
   twiml.say("Sorry, we are unable to process your call at the moment. Please try again later.");
   twiml.hangup();
   res.type('text/xml').send(twiml.toString());
+});
+
+app.get('/api/call-history', (req, res) => {
+  try {
+    // Convert Map to array and sort by timestamp
+    const history = Array.from(callHistory.values())
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+      .slice(0, 100); // Limit to last 100 calls
+    res.json(history);
+  } catch (error) {
+    console.error('Error fetching call history:', error);
+    res.status(500).json({ error: 'Failed to fetch call history' });
+  }
 });
 
 // Start the Server
